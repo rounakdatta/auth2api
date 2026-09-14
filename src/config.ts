@@ -61,6 +61,17 @@ export interface Config {
   timeouts: TimeoutConfig;
   stats: StatsConfig;
   debug: DebugMode;
+  /**
+   * Guard /admin with the api-keys list. Default true, which is the only safe
+   * default for a process reachable on a network.
+   *
+   * Set false ONLY when something in front of the process already
+   * authenticates the caller -- an SSO forward-auth proxy, mTLS, a tailnet.
+   * The admin routes expose the upstream account inventory and a token-reload
+   * trigger, so "no auth here" must always mean "auth happened earlier", never
+   * "no auth at all".
+   */
+  "admin-auth": boolean;
 }
 
 // Raw config shape from YAML (api-keys is an array, not a Set)
@@ -87,6 +98,7 @@ const DEFAULT_RAW: RawConfig = {
     enabled: true,
   },
   debug: "off",
+  "admin-auth": true,
 };
 
 function normalizeDebugMode(value: unknown): DebugMode {

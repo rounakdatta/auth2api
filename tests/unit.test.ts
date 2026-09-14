@@ -1303,3 +1303,86 @@ test("StatsRecorder replay ignores partial schema rows without polluting aggrega
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+// `admin-auth` gates the /admin routes, which expose the upstream account
+// inventory and a token-reload trigger. Both directions are worth pinning:
+// the default must stay closed even for a Config built in code (which is how
+// every test here builds one, and how the absent-key case reaches the server),
+// and the opt-out must actually open it for deployments that authenticate
+// ahead of the process.
+function adminAuthApp(tmp: string, recorder: StatsRecorder, adminAuth?: boolean) {
+  return createServer(
+    {
+      host: "",
+      port: 0,
+      "auth-dir": tmp,
+      "api-keys": new Set(["sk-test"]),
+      "body-limit": "1mb",
+      cloaking: {},
+      timeouts: {
+        "messages-ms": 1000,
+        "stream-messages-ms": 1000,
+        "count-tokens-ms": 1000,
+      },
+      stats: { enabled: true },
+      debug: "off",
+      ...(adminAuth === undefined ? {} : { "admin-auth": adminAuth }),
+    } as any,
+    {} as any,
+    recorder,
+  );
+}
+
+test("admin-auth absent from config still guards /admin", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "auth2api-adminauth-"));
+  const recorder = new StatsRecorder();
+  recorder.start(tmp);
+  const server = adminAuthApp(tmp, recorder, undefined).listen(0);
+  try {
+    const port = (server.address() as any).port;
+    const res = await fetch(`http://127.0.0.1:${port}/admin/stats`);
+    assert.equal(res.status, 401);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await recorder.stop();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("admin-auth true guards /admin, and a valid key still passes", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "auth2api-adminauth-"));
+  const recorder = new StatsRecorder();
+  recorder.start(tmp);
+  const server = adminAuthApp(tmp, recorder, true).listen(0);
+  try {
+    const port = (server.address() as any).port;
+    assert.equal((await fetch(`http://127.0.0.1:${port}/admin/stats`)).status, 401);
+    const ok = await fetch(`http://127.0.0.1:${port}/admin/stats`, {
+      headers: { Authorization: "Bearer sk-test" },
+    });
+    assert.equal(ok.status, 200);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await recorder.stop();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("admin-auth false opens /admin with no key", async () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "auth2api-adminauth-"));
+  const recorder = new StatsRecorder();
+  recorder.start(tmp);
+  const server = adminAuthApp(tmp, recorder, false).listen(0);
+  try {
+    const port = (server.address() as any).port;
+    const res = await fetch(`http://127.0.0.1:${port}/admin/stats`);
+    assert.equal(res.status, 200);
+    // /v1 must be unaffected -- the opt-out is scoped to /admin only.
+    const v1 = await fetch(`http://127.0.0.1:${port}/v1/models`);
+    assert.equal(v1.status, 401);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await recorder.stop();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
