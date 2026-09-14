@@ -192,7 +192,18 @@ export function createServer(
     res.json({ status: "ok" });
   });
 
-  app.use("/admin", requireApiKey);
+  // Opt-out, never the default: see `admin-auth` in config.ts. When it is off,
+  // the deployment in front of this process is asserting that it has already
+  // authenticated the caller.
+  // `!== false`, not a truthiness check: a Config built in code rather than
+  // through loadConfig has no such key, and an absent key must mean the guard
+  // stays ON. Only an explicit `admin-auth: false` removes it.
+  if (config["admin-auth"] !== false) {
+    app.use("/admin", requireApiKey);
+  }
+  // Stays wired either way -- recordStats() returns early when requireApiKey
+  // did not seed res.locals.stats, so unauthenticated admin calls simply go
+  // unrecorded rather than throwing.
   app.use("/admin", statsFinishMiddleware);
 
   // GET /admin/stats — three-axis aggregated call statistics.

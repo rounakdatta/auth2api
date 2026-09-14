@@ -26,6 +26,13 @@ timeouts:
 stats:
   enabled: true
 
+# Guard /admin (stats, accounts, reload) with the api-keys list above.
+# Default true. Set false ONLY when something in front of auth2api already
+# authenticates the caller -- an SSO forward-auth proxy, mTLS, a tailnet --
+# because these routes expose the upstream account inventory and a
+# token-reload trigger.
+admin-auth: true
+
 # Debug logging level:
 # off = no extra logs
 # errors = upstream/network failure details
