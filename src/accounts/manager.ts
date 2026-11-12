@@ -2,7 +2,12 @@ import { ProviderId, TokenData } from "../auth/types";
 import { saveToken, loadAllTokens } from "../auth/token-storage";
 import { getDeviceId } from "../utils/common";
 import { RefreshTokenExhaustedError } from "../auth/refresh-errors";
-import { Allowance, readAllowance } from "./allowance";
+import {
+  Allowance,
+  limitIsAccountWide,
+  readAllowance,
+  servesOnExtraUsage,
+} from "./allowance";
 
 // Reauth-required cooldown: long enough that the account doesn't keep
 // hitting the upstream, but bounded so a re-login auto-recovers next sweep.
@@ -110,6 +115,8 @@ interface AccountState {
   refreshPromise: Promise<boolean> | null;
   /** What Anthropic's latest response said about this account's allowance. */
   allowance: Allowance | null;
+  /** When it was last chosen in order to hear its allowance (epoch ms). */
+  askedAt: number;
 }
 
 export interface AccountSnapshot {
@@ -164,6 +171,10 @@ function randomStickyDuration(): number {
 const RANK_ASK = 0;
 const RANK_PLAN = 1;
 const RANK_EXTRA_USAGE = 2;
+// An account that was asked and still said nothing ranks as plan allowance
+// that refills last: it takes its turn after the accounts known to refill
+// sooner.
+const UNKNOWN_REFILL = Number.MAX_SAFE_INTEGER;
 
 /** Orders AccountManager ranks element by element; a missing element is 0. */
 function compareRank(a: number[], b: number[]): number {
@@ -363,7 +374,8 @@ export class AccountManager {
    * Which account to prefer, from what Anthropic last said about it. Lower
    * sorts first:
    *   [ASK]            not heard from yet, or the week it described has
-   *                    ended: ask it once, so the choice works from facts
+   *                    ended: ask it, so the choice works from facts; once
+   *                    a stretch at most, as it may keep saying nothing
    *   [PLAN, t]        within its plan allowance: the week that refills
    *                    soonest (t) first, since whatever is left of it is
    *                    lost at the refill, while the other accounts'
@@ -371,19 +383,24 @@ export class AccountManager {
    *   [EXTRA_USAGE, t] a limit hit (a window, or one model's cap), so it
    *                    serves on paid extra usage or not at all: only when no
    *                    account has plan allowance left
-   * Accounts that never report an allowance (Codex, Cursor) all rank [ASK],
-   * so they rotate exactly as before.
+   * A cap on one model alone, with no extra usage paid, leaves the account
+   * on [PLAN]: it still serves the other models.
+   * When no account of this manager reports an allowance (Codex, Cursor),
+   * all rank [ASK], so they rotate exactly as before.
    */
-  private rank(acct: AccountState, now: number): number[] {
+  private rank(acct: AccountState, now: number, reporting: boolean): number[] {
     const allowance = acct.allowance;
     const week = allowance?.windows["7d"];
     if (!allowance || !week || week.resetsAt === null || week.resetsAt <= now) {
-      return [RANK_ASK];
+      return reporting && now - acct.askedAt < STICKY_MAX_MS
+        ? [RANK_PLAN, UNKNOWN_REFILL]
+        : [RANK_ASK];
     }
     const limitHit =
       (allowance.status === "rejected" &&
         allowance.resetsAt !== null &&
-        allowance.resetsAt > now) ||
+        allowance.resetsAt > now &&
+        (servesOnExtraUsage(allowance) || limitIsAccountWide(allowance))) ||
       Object.values(allowance.windows).some(
         (w) =>
           w.status === "rejected" && w.resetsAt !== null && w.resetsAt > now,
@@ -409,7 +426,10 @@ export class AccountManager {
     const now = Date.now();
     const stateAt = (idx: number) => this.accounts.get(this.accountOrder[idx])!;
     const usable = (idx: number) => stateAt(idx).cooldownUntil <= now;
-    const rankAt = (idx: number) => this.rank(stateAt(idx), now);
+    const reporting = [...this.accounts.values()].some(
+      (a) => a.allowance !== null,
+    );
+    const rankAt = (idx: number) => this.rank(stateAt(idx), now, reporting);
     const serve = (idx: number): AccountResult => ({
       account: buildAvailableAccount(
         this.authDir,
@@ -444,9 +464,8 @@ export class AccountManager {
           this.lastUsedIndex = idx;
           // Asking an unheard-from account is one request, not a stretch:
           // the next request chooses again, from what it said.
-          const asking =
-            best[0] === RANK_ASK &&
-            this.accountOrder.some((_, j) => rankAt(j)[0] !== RANK_ASK);
+          const asking = best[0] === RANK_ASK && reporting;
+          if (asking) stateAt(idx).askedAt = now;
           this.stickyUntil = asking ? now : now + randomStickyDuration();
           return serve(idx);
         }
@@ -550,10 +569,11 @@ export class AccountManager {
       untilMs !== undefined
         ? Math.min(Math.max(untilMs - now, 1000), MAX_BENCH_MS)
         : Math.min(baseMs * 2 ** Math.max(0, acct.failureCount - 1), maxMs);
-    acct.cooldownUntil = now + cooldownMs;
+    // A later, shorter failure never cuts a longer cooldown short.
+    acct.cooldownUntil = Math.max(acct.cooldownUntil, now + cooldownMs);
     console.log(
       `[${this.provider}] account ${email} cooled down for ${Math.round(
-        cooldownMs / 1000,
+        (acct.cooldownUntil - now) / 1000,
       )}s (${kind})` +
         (untilMs !== undefined
           ? `; upstream says until ${new Date(untilMs).toISOString()}`
@@ -788,6 +808,7 @@ export class AccountManager {
       totalReasoningOutputTokens: 0,
       refreshPromise: null,
       allowance: null,
+      askedAt: 0,
     };
   }
 }

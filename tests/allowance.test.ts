@@ -197,7 +197,22 @@ test("a 429 that says nothing usable leaves the cooldown to the backoff", () => 
     rateLimitedUntil(new Headers({ "retry-after": "0" }), NOW),
     undefined,
   );
-  assert.equal(rateLimitedUntil(SPENT, 1794513600_000 + 1), undefined);
+});
+
+test("a spent 429 whose refill time has already passed is taken at its Retry-After", () => {
+  const headers = new Headers(SPENT);
+  headers.set("anthropic-ratelimit-unified-reset", String(NOW / 1000 - 60));
+  headers.set("retry-after", "120");
+  assert.equal(rateLimitedUntil(headers, NOW), NOW + 120_000);
+});
+
+test("a spent 429 that does not name its limit benches only when the five-hour or weekly window says spent", () => {
+  const named = new Headers(SPENT);
+  named.delete("anthropic-ratelimit-unified-representative-claim");
+  assert.equal(rateLimitedUntil(named, NOW), 1794513600_000);
+  const unnamed = new Headers(named);
+  unnamed.set("anthropic-ratelimit-unified-7d-status", "allowed");
+  assert.equal(rateLimitedUntil(unnamed, NOW), undefined);
 });
 
 // ══════════════════════════════════════════════════
@@ -243,6 +258,14 @@ test("a refill days away is re-checked after six hours, and only when nothing el
     // b falters: a is the one left, so it is asked.
     manager.recordFailure("b@x.test", "server");
     assert.equal(pick(manager), "a@x.test");
+  }));
+
+test("a later, shorter failure does not cut a spent account's bench short", () =>
+  withManager(["a@x.test"], (manager) => {
+    const refill = Date.now() + 2 * HOUR;
+    manager.recordFailure("a@x.test", "rate_limit", undefined, refill);
+    manager.recordFailure("a@x.test", "server");
+    assert.equal(snapshot(manager, "a@x.test").cooldownUntil, refill);
   }));
 
 test("a 429 without a refill time keeps the old one-minute backoff", () =>
@@ -369,6 +392,21 @@ test("asks an account it has not heard from yet, once, then chooses from facts",
     assert.equal(pick(manager), "a@x.test");
   }));
 
+test("an account that never reports its allowance is asked once a stretch, not on every request", () =>
+  withManager(["a@x.test", "x@x.test"], (manager, advance) => {
+    assert.equal(pick(manager), "a@x.test");
+    manager.recordAllowance(
+      "a@x.test",
+      allowanceHeaders({ weekRefillsIn: 1 * DAY }),
+    );
+    advance(STRETCH);
+    assert.equal(pick(manager), "x@x.test", "asked");
+    // x answers without allowance headers (a 401, or count_tokens): a serves.
+    for (let i = 0; i < 5; i++) assert.equal(pick(manager), "a@x.test");
+    advance(STRETCH);
+    assert.equal(pick(manager), "x@x.test", "asked again a stretch later");
+  }));
+
 test("a week that has ended is forgotten, so the account is asked afresh", () =>
   withManager(["a@x.test", "b@x.test"], (manager) => {
     manager.recordAllowance(
@@ -440,6 +478,24 @@ test("extra usage on a limit not read on its own (one model's cap) still counts 
       allowanceHeaders({ weekRefillsIn: 6 * DAY }),
     );
     assert.equal(pick(manager), "b@x.test");
+  }));
+
+test("one model's cap, with no extra usage paid, leaves the account on plan for the other models", () =>
+  withManager(["a@x.test", "b@x.test"], (manager) => {
+    manager.recordAllowance(
+      "a@x.test",
+      allowanceHeaders({
+        weekRefillsIn: 1 * DAY,
+        status: "rejected",
+        claim: "seven_day_opus",
+      }),
+    );
+    manager.recordAllowance(
+      "b@x.test",
+      allowanceHeaders({ weekRefillsIn: 6 * DAY }),
+    );
+    // a's week refills sooner, and it still serves every other model.
+    assert.equal(pick(manager), "a@x.test");
   }));
 
 test("extra usage still serves when no account has plan allowance left", () =>

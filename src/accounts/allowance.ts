@@ -95,6 +95,16 @@ export function servesOnExtraUsage(allowance: Allowance): boolean {
 }
 
 /**
+ * The limit it hit covers every model: the five-hour or weekly allowance. A
+ * response that does not name its limit counts only when one of those
+ * windows says it is spent.
+ */
+export function limitIsAccountWide(allowance: Allowance): boolean {
+  if (allowance.claim !== null) return ACCOUNT_WIDE.has(allowance.claim);
+  return Object.values(allowance.windows).some((w) => w.status === "rejected");
+}
+
+/**
  * When a 429'd account can serve again, by its own account. Undefined when
  * the response does not say, and the caller's own backoff applies.
  *   - five-hour or weekly allowance spent: its refill time
@@ -111,9 +121,10 @@ export function rateLimitedUntil(
   const retryAt =
     retryAfter !== null && retryAfter > 0 ? now + retryAfter * 1000 : undefined;
   if (allowance?.status === "rejected" && !servesOnExtraUsage(allowance)) {
-    if (!ACCOUNT_WIDE.has(allowance.claim ?? "")) return undefined;
-    const until = allowance.resetsAt ?? retryAt;
-    return until !== undefined && until > now ? until : undefined;
+    if (!limitIsAccountWide(allowance)) return undefined;
+    return allowance.resetsAt !== null && allowance.resetsAt > now
+      ? allowance.resetsAt
+      : retryAt;
   }
   return retryAt;
 }
