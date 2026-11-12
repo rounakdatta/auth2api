@@ -5,6 +5,7 @@ import {
   AccountResult,
   AvailableAccount,
 } from "../accounts/manager";
+import { rateLimitedUntil } from "../accounts/allowance";
 import { ProviderId } from "../auth/types";
 import { Config, isDebugLevel } from "../config";
 
@@ -180,6 +181,10 @@ export async function proxyWithRetry(
         return;
       }
 
+      // Anthropic reports the account's allowance on every response, success
+      // or not; the account choice works from it (AccountManager.rank).
+      manager.recordAllowance(account.token.email, upstream.headers);
+
       if (upstream.ok) {
         tagStatsFailure(resp, null, manager.provider);
         try {
@@ -244,8 +249,14 @@ export async function proxyWithRetry(
         lastStatus === 429 ||
         lastStatus >= 500
       ) {
-        // Account-level failures: cooldown, may retry on another account.
-        manager.recordFailure(account.token.email, classifyFailure(lastStatus));
+        // Account-level failures: cooldown, may retry on another account. A
+        // 429 says itself how long the account is out, when it says at all.
+        manager.recordFailure(
+          account.token.email,
+          classifyFailure(lastStatus),
+          undefined,
+          lastStatus === 429 ? rateLimitedUntil(upstream.headers) : undefined,
+        );
       }
       // Other 4xx (400, 404, 422, …) are client request errors — the account is
       // healthy, the request body is bad. Do NOT cool down the account, and do
