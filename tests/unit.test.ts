@@ -259,6 +259,7 @@ test("proxyWithRetry stops retry backoff when client disconnects", async () => {
     getNextAccount: () => ({ account }),
     recordAttempt: () => {},
     recordFailure: () => {},
+    recordAllowance: () => {},
     refreshAccount: async () => false,
   };
 
@@ -294,6 +295,7 @@ test("proxyWithRetry does not write terminal error after client disconnects", as
     getNextAccount: () => ({ account }),
     recordAttempt: () => {},
     recordFailure: () => {},
+    recordAllowance: () => {},
     refreshAccount: async () => false,
   };
 
@@ -344,6 +346,7 @@ test("proxyWithRetry tags stats failure kind for upstream server errors", async 
     getNextAccount: () => ({ account }),
     recordAttempt: () => {},
     recordFailure: () => {},
+    recordAllowance: () => {},
     refreshAccount: async () => false,
   };
 
