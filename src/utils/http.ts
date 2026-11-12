@@ -255,7 +255,9 @@ export async function proxyWithRetry(
           account.token.email,
           classifyFailure(lastStatus),
           undefined,
-          lastStatus === 429 ? rateLimitedUntil(upstream.headers) : undefined,
+          lastStatus === 429 && manager.provider === "anthropic"
+            ? rateLimitedUntil(upstream.headers)
+            : undefined,
         );
       }
       // Other 4xx (400, 404, 422, …) are client request errors — the account is

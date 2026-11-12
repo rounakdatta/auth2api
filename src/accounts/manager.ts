@@ -160,6 +160,11 @@ function randomStickyDuration(): number {
   return STICKY_MIN_MS + Math.random() * (STICKY_MAX_MS - STICKY_MIN_MS);
 }
 
+// AccountManager.rank classes, best first.
+const RANK_ASK = 0;
+const RANK_PLAN = 1;
+const RANK_EXTRA_USAGE = 2;
+
 /** Orders AccountManager ranks element by element; a missing element is 0. */
 function compareRank(a: number[], b: number[]): number {
   for (let i = 0; i < Math.max(a.length, b.length); i++) {
@@ -357,34 +362,43 @@ export class AccountManager {
   /**
    * Which account to prefer, from what Anthropic last said about it. Lower
    * sorts first:
-   *   [0]     not heard from yet, or the week it described has ended: ask it,
-   *           so the choice below works from facts (one request per account
-   *           per week)
-   *   [1, t]  within its plan allowance: the week that refills soonest (t)
-   *           first, since whatever is left of it is lost at the refill, while
-   *           the other accounts' allowance stays in reserve
-   *   [2, t]  a window spent, so it serves on paid extra usage: only when no
-   *           account has plan allowance left
-   * Accounts that never report an allowance (Codex, Cursor) all rank [0], so
-   * they rotate exactly as before.
+   *   [ASK]            not heard from yet, or the week it described has
+   *                    ended: ask it once, so the choice works from facts
+   *   [PLAN, t]        within its plan allowance: the week that refills
+   *                    soonest (t) first, since whatever is left of it is
+   *                    lost at the refill, while the other accounts'
+   *                    allowance stays in reserve
+   *   [EXTRA_USAGE, t] a limit hit (a window, or one model's cap), so it
+   *                    serves on paid extra usage or not at all: only when no
+   *                    account has plan allowance left
+   * Accounts that never report an allowance (Codex, Cursor) all rank [ASK],
+   * so they rotate exactly as before.
    */
   private rank(acct: AccountState, now: number): number[] {
     const allowance = acct.allowance;
     const week = allowance?.windows["7d"];
     if (!allowance || !week || week.resetsAt === null || week.resetsAt <= now) {
-      return [0];
+      return [RANK_ASK];
     }
-    const spent = Object.values(allowance.windows).some(
-      (w) => w.status === "rejected" && w.resetsAt !== null && w.resetsAt > now,
-    );
-    return [spent ? 2 : 1, week.resetsAt];
+    const limitHit =
+      (allowance.status === "rejected" &&
+        allowance.resetsAt !== null &&
+        allowance.resetsAt > now) ||
+      Object.values(allowance.windows).some(
+        (w) =>
+          w.status === "rejected" && w.resetsAt !== null && w.resetsAt > now,
+      );
+    return [limitHit ? RANK_EXTRA_USAGE : RANK_PLAN, week.resetsAt];
   }
 
   /**
-   * Sticky account selection. Among the accounts not in cooldown, the
-   * best-ranked one serves (see rank); the current account is kept for a
-   * sticky 20-60 min while it is still among the best, so prompt caches stay
-   * warm, and the turn passes round-robin among equally ranked accounts.
+   * Sticky account selection. The current account keeps serving for a
+   * sticky 20-60 min, so prompt caches stay warm and a brief failure
+   * elsewhere does not pull traffic back and forth. When that ends, or the
+   * account cools down, the best-ranked account not in cooldown serves (see
+   * rank), taking turns with any that rank equal. The one exception: an
+   * account that has started on paid extra usage gives way at once to one
+   * with plan allowance.
    */
   getNextAccount(): AccountResult {
     const count = this.accountOrder.length;
@@ -413,30 +427,37 @@ export class AccountManager {
     }
 
     if (best) {
-      // Keep the current sticky account while it is among the best.
       const current = this.lastUsedIndex;
       if (
         current >= 0 &&
         now < this.stickyUntil &&
         usable(current) &&
-        compareRank(rankAt(current), best) === 0
+        !(rankAt(current)[0] === RANK_EXTRA_USAGE && best[0] < RANK_EXTRA_USAGE)
       ) {
         return serve(current);
       }
 
-      // Otherwise the next of the best, round-robin.
       const startIdx = current >= 0 ? current + 1 : 0;
       for (let i = 0; i < count; i++) {
         const idx = (startIdx + i) % count;
         if (usable(idx) && compareRank(rankAt(idx), best) === 0) {
           this.lastUsedIndex = idx;
-          this.stickyUntil = now + randomStickyDuration();
+          // Asking an unheard-from account is one request, not a stretch:
+          // the next request chooses again, from what it said.
+          const asking =
+            best[0] === RANK_ASK &&
+            this.accountOrder.some((_, j) => rankAt(j)[0] !== RANK_ASK);
+          this.stickyUntil = asking ? now : now + randomStickyDuration();
           return serve(idx);
         }
       }
     }
 
-    // All accounts in cooldown — find the most recoverable one
+    // All accounts in cooldown. Say when the first one that waiting can
+    // bring back is back: a spent allowance can sit out for hours while
+    // another account is seconds from serving again.
+    const recoverable = (kind: AccountFailureKind) =>
+      kind !== "auth" && kind !== "forbidden";
     const firstAcct = this.accounts.get(this.accountOrder[0])!;
     let bestKind: AccountFailureKind = firstAcct.lastFailureKind ?? "network";
     let bestRemainingMs = Math.max(0, firstAcct.cooldownUntil - now);
@@ -444,17 +465,23 @@ export class AccountManager {
       const acct = this.accounts.get(email)!;
       const kind = acct.lastFailureKind ?? "network";
       const remainingMs = Math.max(0, acct.cooldownUntil - now);
-      if (
-        FAILURE_PRIORITY[kind] < FAILURE_PRIORITY[bestKind] ||
-        (FAILURE_PRIORITY[kind] === FAILURE_PRIORITY[bestKind] &&
-          remainingMs < bestRemainingMs)
-      ) {
+      const better =
+        recoverable(kind) !== recoverable(bestKind)
+          ? recoverable(kind)
+          : recoverable(kind)
+            ? remainingMs < bestRemainingMs ||
+              (remainingMs === bestRemainingMs &&
+                FAILURE_PRIORITY[kind] < FAILURE_PRIORITY[bestKind])
+            : FAILURE_PRIORITY[kind] < FAILURE_PRIORITY[bestKind] ||
+              (FAILURE_PRIORITY[kind] === FAILURE_PRIORITY[bestKind] &&
+                remainingMs < bestRemainingMs);
+      if (better) {
         bestKind = kind;
         bestRemainingMs = remainingMs;
       }
     }
 
-    const isRecoverable = bestKind !== "auth" && bestKind !== "forbidden";
+    const isRecoverable = recoverable(bestKind);
     return {
       account: null,
       failureKind: bestKind,
@@ -696,11 +723,15 @@ export class AccountManager {
       // attempt can retry from a known state.
       saveToken(this.authDir, newToken);
       acct.token = newToken;
-      acct.cooldownUntil = 0;
-      acct.failureCount = 0;
-      acct.lastFailureKind = null;
-      acct.lastError = null;
-      acct.lastFailureAt = null;
+      // A fresh token does not refill a spent allowance: a rate-limit
+      // cooldown stands.
+      if (acct.lastFailureKind !== "rate_limit") {
+        acct.cooldownUntil = 0;
+        acct.failureCount = 0;
+        acct.lastFailureKind = null;
+        acct.lastError = null;
+        acct.lastFailureAt = null;
+      }
       acct.lastSuccessAt = refreshAt;
       acct.lastRefreshAt = refreshAt;
       console.log(
